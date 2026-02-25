@@ -11,14 +11,19 @@ import (
 	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/pager"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sinventory"
 )
 
+const defaultPageSize = 500
+
 type Config struct {
 	k8sinventory.Config
 	Interval time.Duration
+	PageSize int
 }
 
 type Observer struct {
@@ -31,6 +36,9 @@ type Observer struct {
 }
 
 func New(client dynamic.Interface, config Config, logger *zap.Logger, handlePullObjectsFunc func(objects *unstructured.UnstructuredList)) (*Observer, error) {
+	if config.PageSize <= 0 {
+		config.PageSize = defaultPageSize
+	}
 	o := &Observer{
 		client:                client,
 		config:                config,
@@ -76,16 +84,29 @@ func (o *Observer) startPull(ctx context.Context, resource dynamic.ResourceInter
 		listOption.ResourceVersionMatch = metav1.ResourceVersionMatchExact
 	}
 
+	p := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+		return resource.List(ctx, opts)
+	})
+	p.PageSize = int64(o.config.PageSize)
+
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			objects, err := resource.List(ctx, listOption)
+			obj, _, err := p.List(ctx, listOption)
 			if err != nil {
 				o.logger.Error("error in pulling object",
 					zap.String("resource", o.config.Gvr.String()),
 					zap.Error(err))
-			} else if len(objects.Items) > 0 {
+			}
+			objects, ok := obj.(*unstructured.UnstructuredList)
+			if !ok {
+				o.logger.Error("unexpected object type",
+					zap.String("resource", o.config.Gvr.String()),
+					zap.Any("object", obj))
+				continue
+			}
+			if len(objects.Items) > 0 {
 				if o.handlePullObjectsFunc != nil {
 					o.handlePullObjectsFunc(objects)
 				}
